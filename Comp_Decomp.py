@@ -1,315 +1,456 @@
+import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
 from scipy.fftpack import dct, idct
 from collections import Counter
 import heapq
-import os
 
-# --------------- constants here ----------------
-Y_QT = np.array([[16, 11, 10, 16, 24, 40, 51, 61], [12, 12, 14, 19, 26, 58, 60, 55], [14, 13, 16, 24, 40, 57, 69, 56], [14, 17, 22, 29, 51, 87, 80, 62], [
-                18, 22, 37, 56, 68, 109, 103, 77], [24, 35, 55, 64, 81, 104, 113, 92], [49, 64, 78, 87, 103, 121, 120, 101], [72, 92, 95, 98, 112, 100, 103, 99]])
-C_QT = np.array([[17, 18, 24, 47, 99, 99, 99, 99], [18, 21, 26, 66, 99, 99, 99, 99], [24, 26, 56, 99, 99, 99, 99, 99], [47, 66, 99, 99, 99, 99, 99, 99], [
-                99, 99, 99, 99, 99, 99, 99, 99], [99, 99, 99, 99, 99, 99, 99, 99], [99, 99, 99, 99, 99, 99, 99, 99], [99, 99, 99, 99, 99, 99, 99, 99]])
+# quantization tables
+Y_QT = np.array([
+    [16, 11, 10, 16, 24, 40, 51, 61],
+    [12, 12, 14, 19, 26, 58, 60, 55],
+    [14, 13, 16, 24, 40, 57, 69, 56],
+    [14, 17, 22, 29, 51, 87, 80, 62],
+    [18, 22, 37, 56, 68, 109, 103, 77],
+    [24, 35, 55, 64, 81, 104, 113, 92],
+    [49, 64, 78, 87, 103, 121, 120, 101],
+    [72, 92, 95, 98, 112, 100, 103, 99],
+], dtype=np.float64)
+
+C_QT = np.array([
+    [17, 18, 24, 47, 99, 99, 99, 99],
+    [18, 21, 26, 66, 99, 99, 99, 99],
+    [24, 26, 56, 99, 99, 99, 99, 99],
+    [47, 66, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+], dtype=np.float64)
+
+# zigzag order
+_ZIGZAG_INDEX = sorted(
+    ((a, b) for a in range(8) for b in range(8)),
+    key=lambda p: (p[0] + p[1], -p[0] if (p[0] + p[1]) % 2 else p[0]),
+)
 
 
-class Huff:
-    def __init__(self, sym=None, f=0):
-        self.symbol = sym
-        self.freq = f
-        self.l = None
-        self.r = None
+# Huffman node
+class HuffNode:
+    __slots__ = ("symbol", "freq", "left", "right")
 
-    def __lt__(self, oth): return self.freq < oth.freq
+    def __init__(self, symbol=None, freq=0):
+        self.symbol = symbol
+        self.freq = freq
+        self.left = None
+        self.right = None
 
-
-def make_huff_tree(frq):
-    pq = [Huff(s, f) for s, f in frq.items()]
-    heapq.heapify(pq)
-    while len(pq) > 1:
-        n1 = heapq.heappop(pq)
-        n2 = heapq.heappop(pq)
-        m = Huff(f=n1.freq+n2.freq)
-        m.l = n1
-        m.r = n2
-        heapq.heappush(pq, m)
-    return pq[0]
+    def __lt__(self, other):
+        return self.freq < other.freq
 
 
-def gen_codes(root):
-    dct = {}
+# build tree
+def build_huffman_tree(freq_table):
+    heap = [HuffNode(sym, f) for sym, f in freq_table.items()]
+    heapq.heapify(heap)
+    if len(heap) == 1:
+        # single symbol
+        return heap[0]
+    while len(heap) > 1:
+        a = heapq.heappop(heap)
+        b = heapq.heappop(heap)
+        parent = HuffNode(freq=a.freq + b.freq)
+        parent.left, parent.right = a, b
+        heapq.heappush(heap, parent)
+    return heap[0]
 
-    def recur(n, p=""):
-        if n is None:
+
+# assign codes
+def build_codes(root):
+    codes = {}
+    if root.symbol is not None and root.left is None and root.right is None:
+        codes[root.symbol] = "0"  # single symbol fix
+        return codes
+
+    def walk(node, prefix):
+        if node is None:
             return
-        if n.symbol is not None:
-            dct[n.symbol] = p
-        recur(n.l, p+"0")
-        recur(n.r, p+"1")
-    recur(root)
-    return dct
+        if node.symbol is not None:
+            codes[node.symbol] = prefix
+            return
+        walk(node.left, prefix + "0")
+        walk(node.right, prefix + "1")
+
+    walk(root, "")
+    return codes
 
 
-def rgb2ycc(im):
-    im = im.astype(np.float32)
-    y = 0.299*im[:, :, 0] + 0.587*im[:, :, 1] + 0.114*im[:, :, 2]
-    cb = -0.1687*im[:, :, 0] - 0.3313*im[:, :, 1] + 0.5*im[:, :, 2] + 128
-    cr = 0.5*im[:, :, 0] - 0.4187*im[:, :, 1] - 0.0813*im[:, :, 2] + 128
-    return y, cb, cr
+# decode tree node
+class DecodeNode:
+    __slots__ = ("symbol", "left", "right")
+
+    def __init__(self):
+        self.symbol = None
+        self.left = None
+        self.right = None
 
 
-def zzi():
-    return sorted(((a, b) for a in range(8) for b in range(8)), key=lambda p: (p[0]+p[1], -p[0] if (p[0]+p[1]) % 2 else p[0]))
-
-
-def zig(b): return np.array([b[i, j] for i, j in zzi()])
-
-
-def rle(ar):
-    r, zc = [], 0
-    for x in ar:
-        if x == 0:
-            zc += 1
-        else:
-            r.append((zc, x))
-            zc = 0
-    r.append((0, 0))
-    return r
-
-
-def blk_dct(img, q):
-    h, w = img.shape
-    hp = h + (8 - h % 8) % 8
-    wp = w + (8 - w % 8) % 8
-    pimg = np.zeros((hp, wp))
-    pimg[:h, :w] = img - 128
-    r = []
-    for a in range(0, hp, 8):
-        for b in range(0, wp, 8):
-            blk = pimg[a:a+8, b:b+8]
-            d = dct(dct(blk.T, norm='ortho').T, norm='ortho')
-            qnt = np.round(d/q)
-            r.append(rle(zig(qnt)))
-    return r
-
-
-def do_compr(chan, q):
-    blks = blk_dct(chan, q)
-    syms = [s for b in blks for s in b]
-    freq = Counter(syms)
-    tr = make_huff_tree(freq)
-    tbl = gen_codes(tr)
-    bits = ''.join(tbl[s] for s in syms)
-    return {"blocks": blks, "bitstream": bits, "huffman_table": tbl}
-
-
-def jpeg_compr(im):
-    if len(im.shape) == 2 or im.shape[2] == 1:
-        return {"mode": "grayscale", "Y": do_compr(im, Y_QT), "shape": im.shape}
-    y, cb, cr = rgb2ycc(im)
-    return {"mode": "color", "Y": do_compr(y, Y_QT), "Cb": do_compr(cb, C_QT), "Cr": do_compr(cr, C_QT), "shapes": {"Y": y.shape, "Cb": cb.shape, "Cr": cr.shape}}
-
-
-class Tree:
-    def __init__(self): self.symbol = None; self.l = None; self.r = None
-
-
-def rebld(cb):
-    root = Tree()
-    for sym, code in cb.items():
-        n = root
-        for b in code:
-            if b == '0':
-                if n.l is None:
-                    n.l = Tree()
-                n = n.l
+# rebuild tree from codes
+def rebuild_tree(code_table):
+    root = DecodeNode()
+    for symbol, code in code_table.items():
+        node = root
+        for bit in code:
+            if bit == "0":
+                node.left = node.left or DecodeNode()
+                node = node.left
             else:
-                if n.r is None:
-                    n.r = Tree()
-                n = n.r
-        n.symbol = sym
+                node.right = node.right or DecodeNode()
+                node = node.right
+        node.symbol = symbol
     return root
 
 
-def decode_bits(bits, tree):
-    out, n = [], tree
-    for b in bits:
-        n = n.l if b == '0' else n.r
-        if n.symbol is not None:
-            out.append(n.symbol)
-            n = tree
+# decode bitstring
+def decode_bitstring(bits, tree):
+    out = []
+    node = tree
+    if tree.symbol is not None and tree.left is None and tree.right is None:
+        return [tree.symbol] * len(bits)  # single symbol case
+    for bit in bits:
+        node = node.left if bit == "0" else node.right
+        if node is None:
+            raise ValueError("corrupt bitstream: invalid Huffman code")
+        if node.symbol is not None:
+            out.append(node.symbol)
+            node = tree
     return out
 
 
-def rle_dec(rle):
-    x, z = [], 0
-    for a, b in rle:
-        if (a, b) == (0, 0):
-            break
-        x.extend([0]*a)
-        x.append(b)
-    while len(x) < 64:
-        x.append(0)
-    return x
+# pack bits to bytes
+def pack_bits(bitstring):
+    if not bitstring:
+        return np.array([], dtype=np.uint8), 0
+    bit_arr = np.frombuffer(bitstring.encode("ascii"), dtype=np.uint8) - ord("0")
+    packed = np.packbits(bit_arr)
+    return packed, len(bitstring)
 
 
-def zigrev(ar):
-    ind = zzi()
-    blk = np.zeros((8, 8))
-    for i, (a, b) in enumerate(ind):
-        blk[a, b] = ar[i]
-    return blk
+# unpack bytes to bits
+def unpack_bits(packed, bit_length):
+    if bit_length == 0:
+        return ""
+    bits = np.unpackbits(packed)[:bit_length]
+    return "".join("1" if b else "0" for b in bits)
 
 
-def idct_blk(b): return idct(idct(b.T, norm='ortho').T, norm='ortho')
+# RGB to YCbCr
+def rgb_to_ycbcr(img):
+    img = img.astype(np.float32)
+    y = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
+    cb = -0.1687 * img[:, :, 0] - 0.3313 * img[:, :, 1] + 0.5 * img[:, :, 2] + 128
+    cr = 0.5 * img[:, :, 0] - 0.4187 * img[:, :, 1] - 0.0813 * img[:, :, 2] + 128
+    return y, cb, cr
 
 
-def blks_to_img(rleblks, shape, q):
-    h, w = shape
-    hp = h + (8-h % 8) % 8
-    wp = w + (8-w % 8) % 8
-    img = np.zeros((hp, wp))
-    idx = 0
-    for a in range(0, hp, 8):
-        for b in range(0, wp, 8):
-            blk = zigrev(rle_dec(rleblks[idx])) * q
-            pix = idct_blk(blk) + 128
-            img[a:a+8, b:b+8] = np.clip(pix, 0, 255)
-            idx += 1
-    return img[:h, :w]
-
-
-def ycc2rgb(y, cb, cr):
+# YCbCr to RGB
+def ycbcr_to_rgb(y, cb, cr):
     y = y.astype(np.float32)
-    cb -= 128
-    cr -= 128
-    r = y + 1.402*cr
-    g = y - 0.344136*cb - 0.714136*cr
-    b = y + 1.772*cb
+    cb = cb.astype(np.float32) - 128
+    cr = cr.astype(np.float32) - 128
+    r = y + 1.402 * cr
+    g = y - 0.344136 * cb - 0.714136 * cr
+    b = y + 1.772 * cb
     return np.clip(np.stack([r, g, b], axis=2), 0, 255).astype(np.uint8)
 
 
-def decompress_stuff(npz):
-    d = npz['compressed'].item()
-    if d['mode'] == 'grayscale':
-        y = blks_to_img(d['Y']['blocks'], d['shape'], Y_QT)
-        return y.astype(np.uint8)
-    yt = rebld(d['Y']['huffman_table'])
-    cbt = rebld(d['Cb']['huffman_table'])
-    crt = rebld(d['Cr']['huffman_table'])
-    ysy = decode_bits(d['Y']['bitstream'], yt)
-    cbs = decode_bits(d['Cb']['bitstream'], cbt)
-    crs = decode_bits(d['Cr']['bitstream'], crt)
-
-    def splitblks(s):
-        r, b = [], []
-        for sym in s:
-            b.append(sym)
-            if sym == (0, 0):
-                r.append(b)
-                b = []
-        return r
-    y = blks_to_img(splitblks(ysy), d['shapes']['Y'], Y_QT)
-    cb = blks_to_img(splitblks(cbs), d['shapes']['Cb'], C_QT)
-    cr = blks_to_img(splitblks(crs), d['shapes']['Cr'], C_QT)
-    return ycc2rgb(y, cb, cr)
-
-# ---------------- GUI Code -----------------
+# zigzag scan
+def zigzag(block):
+    return np.array([block[i, j] for i, j in _ZIGZAG_INDEX])
 
 
-class GUI:
+# reverse zigzag
+def unzigzag(arr):
+    block = np.zeros((8, 8))
+    for i, (a, b) in enumerate(_ZIGZAG_INDEX):
+        block[a, b] = arr[i]
+    return block
+
+
+# run-length encode
+def run_length_encode(arr):
+    pairs, zero_run = [], 0
+    for v in arr:
+        if v == 0:
+            zero_run += 1
+        else:
+            pairs.append((zero_run, v))
+            zero_run = 0
+    pairs.append((0, 0))  # end marker
+    return pairs
+
+
+# run-length decode
+def run_length_decode(pairs):
+    out = []
+    for zero_run, val in pairs:
+        if (zero_run, val) == (0, 0):
+            break
+        out.extend([0] * zero_run)
+        out.append(val)
+    if len(out) < 64:
+        out.extend([0] * (64 - len(out)))
+    return out[:64]
+
+
+# DCT per block
+def channel_to_blocks(channel, qtable):
+    h, w = channel.shape
+    hp = h + (8 - h % 8) % 8
+    wp = w + (8 - w % 8) % 8
+    padded = np.zeros((hp, wp))
+    padded[:h, :w] = channel - 128
+    blocks = []
+    for y0 in range(0, hp, 8):
+        for x0 in range(0, wp, 8):
+            block = padded[y0:y0 + 8, x0:x0 + 8]
+            coeffs = dct(dct(block.T, norm="ortho").T, norm="ortho")
+            quantized = np.round(coeffs / qtable)
+            blocks.append(run_length_encode(zigzag(quantized)))
+    return blocks, (hp // 8) * (wp // 8)
+
+
+# inverse DCT per block
+def blocks_to_channel(rle_blocks, shape, qtable):
+    h, w = shape
+    hp = h + (8 - h % 8) % 8
+    wp = w + (8 - w % 8) % 8
+    out = np.zeros((hp, wp))
+    idx = 0
+    for y0 in range(0, hp, 8):
+        for x0 in range(0, wp, 8):
+            coeffs = unzigzag(run_length_decode(rle_blocks[idx])) * qtable
+            pixels = idct(idct(coeffs.T, norm="ortho").T, norm="ortho") + 128
+            out[y0:y0 + 8, x0:x0 + 8] = np.clip(pixels, 0, 255)
+            idx += 1
+    return out[:h, :w]
+
+
+# full channel encode
+def encode_channel(channel, qtable):
+    blocks, n_blocks = channel_to_blocks(channel, qtable)
+    symbols = [s for block in blocks for s in block]
+    freq = Counter(symbols)
+    tree = build_huffman_tree(freq)
+    codes = build_codes(tree)
+    bitstring = "".join(codes[s] for s in symbols)
+    packed, bit_len = pack_bits(bitstring)
+    return {
+        "packed_bits": packed,
+        "bit_length": bit_len,
+        "codes": codes,
+        "n_blocks": n_blocks,
+        "shape": channel.shape,
+    }
+
+
+# full channel decode
+def decode_channel(payload, qtable):
+    tree = rebuild_tree(payload["codes"])
+    bitstring = unpack_bits(payload["packed_bits"], payload["bit_length"])
+    symbols = decode_bitstring(bitstring, tree)
+
+    blocks, current = [], []
+    for sym in symbols:
+        current.append(sym)
+        if sym == (0, 0):
+            blocks.append(current)
+            current = []
+    if len(blocks) != payload["n_blocks"]:
+        raise ValueError(
+            f"expected {payload['n_blocks']} blocks, decoded {len(blocks)} "
+            "- the file is corrupt or truncated"
+        )
+    return blocks_to_channel(blocks, payload["shape"], qtable)
+
+
+# compress full image
+def compress_image(img):
+    if img.ndim == 2 or img.shape[2] == 1:
+        return {"mode": "grayscale", "Y": encode_channel(img, Y_QT)}
+    y, cb, cr = rgb_to_ycbcr(img)
+    return {
+        "mode": "color",
+        "Y": encode_channel(y, Y_QT),
+        "Cb": encode_channel(cb, C_QT),
+        "Cr": encode_channel(cr, C_QT),
+    }
+
+
+# decompress full image
+def decompress_image(payload):
+    if payload["mode"] == "grayscale":
+        return np.clip(decode_channel(payload["Y"], Y_QT), 0, 255).astype(np.uint8)
+    y = decode_channel(payload["Y"], Y_QT)
+    cb = decode_channel(payload["Cb"], C_QT)
+    cr = decode_channel(payload["Cr"], C_QT)
+    return ycbcr_to_rgb(y, cb, cr)
+
+
+# GUI class
+class JpegToolzGUI:
+    PREVIEW_W, PREVIEW_H = 450, 320
+
     def __init__(self, master):
         self.win = master
         master.title("JPEG Toolz")
-        master.geometry("520x620")
+        master.geometry("520x640")
+        master.resizable(False, False)
 
-        self.cnvs = tk.Canvas(master, width=450, height=320, bg='lightgray')
-        self.cnvs.pack(pady=8)
+        self.canvas = tk.Canvas(master, width=self.PREVIEW_W, height=self.PREVIEW_H, bg="lightgray")
+        self.canvas.pack(pady=8)
 
-        frm = tk.Frame(master)
-        frm.pack(pady=5)
+        btn_frame = tk.Frame(master)
+        btn_frame.pack(pady=5)
 
-        self.btn1 = tk.Button(frm, text="Load Img", command=self.loadimg)
-        self.btn1.grid(row=0, column=0, padx=4)
+        tk.Button(btn_frame, text="Load Image", width=16, command=self.load_image).grid(row=0, column=0, padx=4, pady=2)
+        tk.Button(btn_frame, text="Compress + Save", width=16, command=self.compress_and_save).grid(row=0, column=1, padx=4, pady=2)
+        tk.Button(btn_frame, text="Decompress", width=16, command=self.decompress_file).grid(row=1, column=0, padx=4, pady=2)
+        tk.Button(btn_frame, text="Save As Image", width=16, command=self.save_image).grid(row=1, column=1, padx=4, pady=2)
 
-        self.btn2 = tk.Button(frm, text="Compress+Save",
-                              command=self.comp_save)
-        self.btn2.grid(row=0, column=1, padx=4)
+        self.status = tk.Label(master, text="Status: ready", font=("Arial", 10), wraplength=480, justify="left")
+        self.status.pack(pady=6)
 
-        self.btn3 = tk.Button(frm, text="Decompress", command=self.decompfile)
-        self.btn3.grid(row=1, column=0, padx=4)
+        self.current_image = None
+        self._preview_ref = None
+        self._source_path = None
+        self._busy = False
 
-        self.btn4 = tk.Button(frm, text="Save Output", command=self.saveimg)
-        self.btn4.grid(row=1, column=1, padx=4)
+    # update status text
+    def set_status(self, text):
+        self.status.config(text=f"Status: {text}")
 
-        self.lbl = tk.Label(master, text="Status: ok", font=("Arial", 10))
-        self.lbl.pack()
+    # show preview image
+    def show_preview(self, rgb_array):
+        img = Image.fromarray(rgb_array)
+        img.thumbnail((self.PREVIEW_W, self.PREVIEW_H))  # keep aspect
+        self._preview_ref = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        x = (self.PREVIEW_W - img.width) // 2
+        y = (self.PREVIEW_H - img.height) // 2
+        self.canvas.create_image(x, y, anchor=tk.NW, image=self._preview_ref)
 
-        self.img_now = None
-        self.ph = None
-
-    def loadimg(self):
-        fp = filedialog.askopenfilename(
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")])
-        if not fp:
+    # run worker thread
+    def run_in_background(self, worker, on_done):
+        if self._busy:
+            messagebox.showinfo("Busy", "Please wait for the current operation to finish.")
             return
-        try:
-            i = cv2.imread(fp)
-            if i is None:
-                raise Exception("couldn't load")
-            self.img_now = cv2.cvtColor(i, cv2.COLOR_BGR2RGB)
-            im = Image.fromarray(self.img_now).resize((450, 320))
-            self.ph = ImageTk.PhotoImage(im)
-            self.cnvs.create_image(0, 0, anchor=tk.NW, image=self.ph)
-            self.lbl.config(text=f"Loaded: {os.path.basename(fp)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._busy = True
 
-    def comp_save(self):
-        if self.img_now is None:
-            messagebox.showwarning("Error", "Load image first")
-            return
-        try:
-            c = jpeg_compr(self.img_now)
-            fp = filedialog.asksaveasfilename(
-                defaultextension=".npz", filetypes=[("NPZ", "*.npz")])
-            if fp:
-                np.savez_compressed(fp, compressed=c)
-                messagebox.showinfo("Saved", f"Compressed at:\n{fp}")
-        except Exception as e:
-            messagebox.showerror("Oops", f"Compression failed:\n{e}")
-
-    def decompfile(self):
-        fp = filedialog.askopenfilename(filetypes=[("NPZ", "*.npz")])
-        if not fp:
-            return
-        try:
-            d = np.load(fp, allow_pickle=True)
-            self.img_now = decompress_stuff(d)
-            im = Image.fromarray(self.img_now).resize((450, 320))
-            self.ph = ImageTk.PhotoImage(im)
-            self.cnvs.create_image(0, 0, anchor=tk.NW, image=self.ph)
-            self.lbl.config(text=f"Decompressed: {os.path.basename(fp)}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Decompression error:\n{e}")
-
-    def saveimg(self):
-        if self.img_now is None:
-            messagebox.showwarning("Wait", "No image to save")
-            return
-        fp = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[
-                                          ("JPEG", "*.jpg *.jpeg")])
-        if fp:
+        def target():
             try:
-                Image.fromarray(self.img_now).save(fp)
-                messagebox.showinfo("Yay", f"Saved at:\n{fp}")
-            except Exception as e:
-                messagebox.showerror("Fail", f"Couldn't save:\n{e}")
+                result = worker()
+                error = None
+            except Exception as exc:
+                result, error = None, exc
+            self.win.after(0, lambda: self._finish(on_done, result, error))
+
+        threading.Thread(target=target, daemon=True).start()
+
+    # finish background task
+    def _finish(self, on_done, result, error):
+        self._busy = False
+        if error is not None:
+            messagebox.showerror("Error", str(error))
+            self.set_status("failed - see error dialog")
+            return
+        on_done(result)
+
+    # load image file
+    def load_image(self):
+        path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")])
+        if not path:
+            return
+        try:
+            raw = cv2.imread(path)
+            if raw is None:
+                raise ValueError("could not read that file as an image")
+            self.current_image = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+            self._source_path = path
+            self.show_preview(self.current_image)
+            self.set_status(f"loaded {os.path.basename(path)} ({self.current_image.shape[1]}x{self.current_image.shape[0]})")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+    # compress and save
+    def compress_and_save(self):
+        if self.current_image is None:
+            messagebox.showwarning("No image", "Load an image first.")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".npz", filetypes=[("Compressed", "*.npz")])
+        if not save_path:
+            return
+        original_size = os.path.getsize(self._source_path) if self._source_path else None
+        self.set_status("compressing...")
+
+        def worker():
+            payload = compress_image(self.current_image)
+            np.savez_compressed(save_path, compressed=payload, allow_pickle=True)
+            return os.path.getsize(save_path)
+
+        def done(compressed_size):
+            if original_size:
+                ratio = original_size / max(compressed_size, 1)
+                self.set_status(
+                    f"saved {os.path.basename(save_path)} - "
+                    f"{original_size:,}B -> {compressed_size:,}B ({ratio:.2f}x)"
+                )
+            else:
+                self.set_status(f"saved {os.path.basename(save_path)} ({compressed_size:,} bytes)")
+
+        self.run_in_background(worker, done)
+
+    # decompress file
+    def decompress_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Compressed", "*.npz")])
+        if not path:
+            return
+        self.set_status("decompressing...")
+
+        def worker():
+            npz = np.load(path, allow_pickle=True)
+            payload = npz["compressed"].item()
+            return decompress_image(payload)
+
+        def done(rgb_array):
+            self.current_image = rgb_array
+            self._source_path = None
+            self.show_preview(rgb_array)
+            self.set_status(f"decompressed {os.path.basename(path)}")
+
+        self.run_in_background(worker, done)
+
+    # save as image
+    def save_image(self):
+        if self.current_image is None:
+            messagebox.showwarning("Nothing to save", "There is no image in memory yet.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG", "*.jpg *.jpeg"), ("PNG", "*.png")])
+        if not path:
+            return
+        try:
+            Image.fromarray(self.current_image).save(path)
+            self.set_status(f"saved image to {os.path.basename(path)}")
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
 
 
 if __name__ == "__main__":
-    r = tk.Tk()
-    a = GUI(r)
-    r.mainloop()
+    root = tk.Tk()
+    JpegToolzGUI(root)
+    root.mainloop()
